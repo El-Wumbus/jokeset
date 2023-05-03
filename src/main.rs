@@ -166,6 +166,7 @@ async fn scrape(output: &Path, joke_tasks: u16, length_limit: Option<usize>) -> 
     header_span.pb_set_length(joke_tasks as u64);
     let header_span_enter = header_span.enter();
     loop {
+        Span::current().pb_set_position(0);
         // We collect so we consume the iterator and run the map.
         let tasks = (1_u16..=joke_tasks)
             .map(|i| {
