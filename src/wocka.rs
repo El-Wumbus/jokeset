@@ -2,9 +2,19 @@ use std::num::NonZeroU64;
 
 use lazy_static::lazy_static;
 use scraper::{Html, Selector};
+use serde::{Deserialize, Serialize};
 
-use crate::{Error, WockaJoke};
+use crate::Error;
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct WockaJoke {
+    pub title: String,
+    pub body: String,
+    pub id: NonZeroU64,
+    pub category: String,
+}
+
+// Use lazy static to cache everything, there's no reason to make a selector thousands of times over.
 lazy_static! {
     pub static ref CONTENT_SELECTOR: Selector = Selector::parse("div#content").unwrap();
     pub static ref TITLE_SELECTOR: Selector = Selector::parse("div#content h2").unwrap();
@@ -30,9 +40,7 @@ pub async fn extract_joke(id: NonZeroU64) -> Result<WockaJoke, Error> {
 
     let joke_details_table = document
         .select(&CONTENT_CONTENTS_SELCTOR)
-        .map(|x| x.text().collect::<Vec<_>>())
-        .into_iter()
-        .flatten()
+        .flat_map(|x| x.text().collect::<Vec<_>>())
         .filter_map(|x| {
             let x = x.trim();
             if !x.is_empty() {
@@ -52,7 +60,8 @@ pub async fn extract_joke(id: NonZeroU64) -> Result<WockaJoke, Error> {
 
     let category = joke_details_table
         .get(category_position)
-        .ok_or(Error::Unhandled("Malformed wocka.com HTML".into()))?.to_owned();
+        .ok_or(Error::Unhandled("Malformed wocka.com HTML".into()))?
+        .to_owned();
 
     // Select `div#content`, actually grab it's child nodes instead.
     // Filter out all but text nodes. Text nodes are trimmed. Then collect,
@@ -62,7 +71,7 @@ pub async fn extract_joke(id: NonZeroU64) -> Result<WockaJoke, Error> {
         .map(|x| x.children())
         .next()
         .ok_or(Error::Unhandled("Malformed wocka.com HTML".into()))?
-        .filter_map(|x| x.value().as_text().and_then(|x| Some(x.to_string())))
+        .filter_map(|x| x.value().as_text().map(|x| x.to_string()))
         .filter_map(|x| {
             let x = x.trim();
             if !x.is_empty() {

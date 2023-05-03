@@ -1,87 +1,145 @@
 #![feature(async_closure)]
 use std::{
-    num::{NonZeroU64, NonZeroUsize, NonZeroU16},
-    path::PathBuf,
-    process::exit,
-    sync::Arc,
+    mem,
+    num::{NonZeroU16, NonZeroU64},
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 use csv::StringRecord;
 use csv_async as csv;
-use indicatif::{ProgressIterator, ProgressStyle};
+use indicatif::ProgressStyle;
 use serde::{Deserialize, Serialize};
 use structopt::StructOpt;
 use tokio::{
-    fs::{self, File},
-    io::{BufReader, BufWriter, AsyncWriteExt},
-    task,
+    fs::File,
+    io::{BufReader, BufWriter},
+    task, time,
+};
+use tokio_stream::StreamExt;
+use tracing::{info_span, Span, metadata::LevelFilter, event, Level};
+use tracing_indicatif::{
+    filter::{hide_indicatif_span_fields, IndicatifFilter},
+    span_ext::IndicatifSpanExt,
+    IndicatifLayer,
+};
+use tracing_subscriber::{
+    fmt::format::DefaultFields,
+    layer:: SubscriberExt,
+    util::SubscriberInitExt,
+    Layer, EnvFilter,
 };
 
 // mod reddit;
 mod error;
-mod wocka;
 use error::Error;
+mod wocka;
+use wocka::WockaJoke;
 
-pub const PROGRAM_NAME: &str = env!("CARGO_PKG_NAME");
-pub const PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
-const OS: &str = std::env::consts::OS;
-
-const REDDIT_JOKE_PATH: &str = "../reddit_jokes.json";
-const STUPIDSTUFF_JOKE_PATH: &str = "../stupidstuff.json";
 const WOCKA_JOKE_PATH: &str = "wocka.csv";
-const OUTPUT_JOKE_PATH: &str = "jokes_filtered.csv";
-const MINIMUM_REDDIT_UPVOTES: isize = 32;
-const MINIMUM_STUPIDSTUFF_RATING: f64 = 3.5;
+const WOCKA_JOKE_JSON: &str = "wocka.json";
 
 #[derive(Debug, Clone, PartialEq, StructOpt)]
 enum Options {
+    /// Scrape jokes from wocka.com
     Scrape {
+        /// Output file in CSV format
         #[structopt(long, short, default_value = WOCKA_JOKE_PATH, name = "FILE")]
         output: PathBuf,
 
-        #[structopt(long)]
-        no_wocka: bool,
-
-        /// Jokes are scraped in batches, this is the size of a batch.
+        /// Jokes are scraped in batches, this is the size of a batch. Large batches may lead to an IP block.
         #[structopt(short, long, default_value = "50")]
         tasks: NonZeroU16,
+
+        #[structopt(short, long)]
+        resume: Option<NonZeroU64>,
+
+        /// Length limit, in characters, of a joke body.
+        #[structopt(short, long, name = "COUNT")]
+        length_limit: Option<usize>,
     },
+    /// Count rows/jokes in a CSV file
     Count {
-        #[structopt(long, short, default_value = WOCKA_JOKE_PATH, name = "FILE")]
+        #[structopt(default_value = WOCKA_JOKE_PATH, name = "FILE")]
         input: PathBuf,
     },
+
+    /// Convert the Joke CSV to JSON
+    Json {
+        #[structopt(default_value = WOCKA_JOKE_PATH, name = "IN")]
+        input: PathBuf,
+
+        /// Output file in CSV format
+        #[structopt(long, short, default_value = WOCKA_JOKE_JSON, name = "OUT")]
+        output: PathBuf,
+    },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-struct RedditJoke {
-    id: String,
-    score: isize,
-    title: String,
-    body: String,
-}
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    let options = Options::from_args();
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct WockaJoke {
-    title: String,
-    body: String,
-    id: NonZeroU64,
-    category: String,
-}
+    let indicatif_layer = IndicatifLayer::new()
+        .with_span_field_formatter(hide_indicatif_span_fields(DefaultFields::new()));
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-struct StupidstuffJoke {
-    category: String,
-    body: String,
-    id: NonZeroU64,
-    rating: f64,
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .parse("")?;
+    
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(indicatif_layer.get_stderr_writer())
+                .with_filter(filter),
+        )
+        .with(indicatif_layer.with_filter(IndicatifFilter::new(true)))
+        .init();
+
+    match options {
+        Options::Scrape {
+            output,
+            tasks,
+            resume: _,
+            length_limit,
+        } => {
+            scrape(&output, tasks.into(), length_limit).await?;
+        }
+        Options::Count { input } => {
+            let joke_file_reader = BufReader::new(File::open(&input).await?);
+            let mut csv_deseraializer = csv::AsyncDeserializer::from_reader(joke_file_reader);
+            let mut record = StringRecord::new();
+            let mut rows = 0;
+            while csv_deseraializer.read_record(&mut record).await? {
+                rows += 1;
+            }
+            println!("\"{}\" has {rows} jokes.", input.display());
+        }
+        Options::Json { input, output } => {
+            let joke_file_reader = BufReader::new(File::open(&input).await?);
+            let mut csv_deseraializer = csv::AsyncDeserializer::from_reader(joke_file_reader);
+            let mut csv_stream = csv_deseraializer.deserialize::<Joke>();
+            let mut jokes: Vec<Joke> = Vec::new();
+            while let Some(joke) = csv_stream.next().await {
+                let joke = joke?;
+                jokes.push(joke);
+            }
+            let joke_file_json_writer =
+                std::io::BufWriter::new(File::create(&output).await?.into_std().await);
+            task::spawn_blocking(move || {
+                serde_json::to_writer_pretty(joke_file_json_writer, &jokes)
+            })
+            .await??;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 struct Joke {
-    footer: String,
-    body: String,
     title: String,
+    body: String,
+    footer: String,
 }
 
 impl From<WockaJoke> for Joke {
@@ -97,177 +155,57 @@ impl From<WockaJoke> for Joke {
     }
 }
 
-impl From<RedditJoke> for Joke {
-    fn from(value: RedditJoke) -> Self {
-        Self {
-            footer: format!(
-                "Source: reddit.com/r/jokes, Rating: {}, ID: {}",
-                value.score, value.id
-            ),
-            body: value.body,
-            title: value.title,
-        }
-    }
-}
-
-impl From<StupidstuffJoke> for Joke {
-    fn from(value: StupidstuffJoke) -> Self {
-        Self {
-            footer: format!(
-                "Source: stupidstuff.org, Category: {}, Rating: {}, ID: {}",
-                value.category, value.rating, value.id
-            ),
-            body: value.body,
-            title: "".into(),
-        }
-    }
-}
-
-async fn scrape(output: PathBuf, no_wocka: bool, joke_tasks: u16) -> Result<(), Error> {
+async fn scrape(output: &Path, joke_tasks: u16, length_limit: Option<usize>) -> Result<(), Error> {
     let joke_file_writer = BufWriter::new(File::create(output).await?);
     let mut csv_serializer = csv::AsyncSerializer::from_writer(joke_file_writer);
     let mut offset: u64 = 0;
     let mut errors = 0;
     println!("Starting...");
+    let header_span = info_span!("header");
+    header_span.pb_set_style(&ProgressStyle::default_bar());
+    header_span.pb_set_length(joke_tasks as u64);
+    let header_span_enter = header_span.enter();
     loop {
-        let tasks = (1 as u16..=joke_tasks)
-            .into_iter()
+        // We collect so we consume the iterator and run the map.
+        let tasks = (1_u16..=joke_tasks)
             .map(|i| {
                 task::spawn(async move {
                     wocka::extract_joke(NonZeroU64::new(i as u64 + offset).unwrap()).await
                 })
             })
-            .collect::<Vec<_>>()
-            .into_iter();
+            .collect::<Vec<_>>();
 
-        for task in tasks.progress() {
+
+        for task in tasks {
+            Span::current().pb_inc(1);
             match task.await.unwrap() {
+                
                 Ok(x) => {
                     let joke: Joke = x.into();
-                    // let json = task::spawn_blocking(move|| serde_json::to_string(&joke)).await??;
+                    if let Some(length_limit) = length_limit {
+                        if joke.body.len() > length_limit {
+                            continue;
+                        }
+                    }
                     csv_serializer.serialize(&joke).await.unwrap();
-                    // let x = joke_file_writer.write_all(json.as_bytes()).await?;
                     errors = 0;
                 }
-                Err(e) => {
+                Err(Error::Unhandled(_)) => {
                     errors += 1;
                 }
+                Err(e) => {
+                    event!(Level::ERROR, "{e}");
+                }
             };
-            // Sleep for a bit to maybe not get blocked.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        if errors > 2000 {
-            break;
         }
         offset += joke_tasks as u64;
-    }
-
-    Ok(())
-}
-
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    let options = Options::from_args();
-
-    match options {
-        Options::Scrape {
-            output,
-            no_wocka,
-            tasks,
-        } => scrape(output, no_wocka, tasks.into()).await?,
-        Options::Count { input } => {
-            let joke_file_reader = BufReader::new(File::open(&input).await?);
-            let mut csv_deseraializer = csv::AsyncDeserializer::from_reader(joke_file_reader);
-            let mut record = StringRecord::new();
-            let mut rows = 0;
-            while csv_deseraializer.read_record(&mut record).await? {
-                rows +=1;
-            }
-            println!("\"{}\" has {rows} jokes.", input.display());
+        event!(Level::INFO, "{offset} Joke pages visited.");
+        // Only stop if we've failed 1500 times in a row, that way we've likey reached the end.
+        if errors > 1500 {
+            break;
         }
+        time::sleep(Duration::from_millis(100)).await;
     }
-
-    // println!("Filtering...");
-    // let mut jokes = filter_reddit().await;
-    // jokes.append(&mut filter_stupidstuff().await?);
-    // jokes.append(&mut filter_wocka().await);
-    // let joke_file_writer = BufWriter::new(File::create(OUTPUT_JOKE_PATH).await?);
-    // let mut csv_serializer = csv::AsyncSerializer::from_writer(joke_file_writer);
-    // println!("Saving...");
-    // for joke in jokes.iter().progress() {
-    //     csv_serializer.serialize(joke).await?;
-    // }
-
+    mem::drop(header_span_enter);
     Ok(())
-}
-
-async fn filter_stupidstuff() -> Result<Vec<Joke>, Error> {
-    let jokes_data = fs::read(STUPIDSTUFF_JOKE_PATH).await?;
-    let jokes = task::spawn_blocking(move || {
-        serde_json::from_slice::<Vec<StupidstuffJoke>>(&jokes_data).unwrap()
-    })
-    .await
-    .unwrap();
-    // Filter out the following jokes:
-    //
-    // - Jokes with less than `MINIMUM_REDDIT_UPVOTES` score
-    Ok(tokio_rayon::spawn(move || {
-        jokes
-            .into_iter()
-            .progress()
-            .filter(|joke| joke.rating >= MINIMUM_STUPIDSTUFF_RATING)
-            .map(|x| {
-                let x: Joke = x.into();
-                x
-            })
-            .collect::<Vec<_>>()
-    })
-    .await)
-}
-
-async fn filter_reddit() -> Vec<Joke> {
-    let reddit_jokes_data = fs::read(REDDIT_JOKE_PATH).await.unwrap();
-    let reddit_jokes = task::spawn_blocking(move || {
-        serde_json::from_slice::<Vec<RedditJoke>>(&reddit_jokes_data).unwrap()
-    })
-    .await
-    .unwrap();
-
-    tokio_rayon::spawn(move || {
-        // Filter out the following jokes:
-        //
-        // - Jokes with less than `MINIMUM_REDDIT_UPVOTES` score
-        reddit_jokes
-            .into_iter()
-            .progress()
-            .filter(|joke| joke.score >= MINIMUM_REDDIT_UPVOTES)
-            .map(|x| {
-                let x: Joke = x.into();
-                x
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-}
-
-async fn filter_wocka() -> Vec<Joke> {
-    let jokes_data = fs::read(WOCKA_JOKE_PATH).await.unwrap();
-    let jokes = task::spawn_blocking(move || {
-        serde_json::from_slice::<Vec<WockaJoke>>(&jokes_data).unwrap()
-    })
-    .await
-    .unwrap();
-    // Filter out the following jokes:
-    //
-    // - Jokes with less than `MINIMUM_REDDIT_UPVOTES` score
-    tokio_rayon::spawn(move || {
-        jokes
-            .into_iter()
-            .map(|x| {
-                let x: Joke = x.into();
-                x
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
 }

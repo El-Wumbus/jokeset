@@ -10,17 +10,17 @@ anyhow = "1.0.71"
 csv-async = { version = "1.2.6", features = ["tokio"] }
 indicatif = { version = "0.17.3", features = ["tokio"] }
 lazy_static = "1.4.0"
-log = "0.4.17"
-reqwest = { version = "0.11.17", features = ["tokio-rustls", "rustls", "blocking"] }
-ron = "0.8.0"
-roux = { version = "2.2.7", features = ["rustls"] }
+reqwest = { version = "0.11.17", features = ["tokio-rustls", "rustls"] }
 scraper = "0.16.0"
 serde = { version = "1.0.160", features = ["derive"] }
 serde_json = "1.0.96"
 structopt = { version = "0.3.26", features = ["color", "suggestions"] }
 thiserror = "1.0.40"
 tokio = { version = "1.28.0", features = ["rt", "rt-multi-thread", "macros", "fs"] }
-tokio-rayon = "2.1.0"
+tokio-stream = "0.1.14"
+tracing = "0.1.37"
+tracing-indicatif = "0.3.4"
+tracing-subscriber = { version = "0.3.17", default-features = false, features = ["std", "alloc", "ansi", "fmt", "local-time", "env-filter", "smallvec", "thread_local"] }
 
 [profile.release]
 strip = true
